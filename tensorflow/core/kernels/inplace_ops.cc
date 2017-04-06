@@ -25,7 +25,9 @@ limitations under the License.
 
 namespace tensorflow {
 typedef Eigen::ThreadPoolDevice CPUDevice;
+#ifdef TENSORFLOW_USE_SYCL
 typedef Eigen::SyclDevice SyclDevice;
+#endif // TENSORFLOW_USE_SYCL
 
 namespace functor {
 
