@@ -245,7 +245,6 @@ REGISTER_KERNEL_BUILDER(Name("_ParallelConcatUpdate")
                             .HostMemory("output")
                             .TypeConstraint<int32>("T"),
                         ParallelConcatUpdate<CPUDevice>);
-
 #endif
 
 }  // end namespace
