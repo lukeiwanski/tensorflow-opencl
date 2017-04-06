@@ -25,11 +25,12 @@ limitations under the License.
 
 namespace tensorflow {
 typedef Eigen::ThreadPoolDevice CPUDevice;
+typedef Eigen::SyclDevice SyclDevice;
 
 namespace functor {
 
-template <typename T>
-Status DoParallelConcatUpdate(const CPUDevice& d, const Tensor& value,
+template <typename Device, typename T>
+Status DoParallelConcatUpdate(const Device& d, const Tensor& value,
                               int32 loc, Tensor* output) {
   auto Tvalue = value.flat_outer_dims<T>();
   auto Toutput = output->flat_outer_dims<T>();
@@ -46,7 +47,7 @@ Status DoParallelConcat(const CPUDevice& d, const Tensor& value, int32 loc,
   switch (value.dtype()) {
 #define CASE(type)                  \
   case DataTypeToEnum<type>::value: \
-    return DoParallelConcatUpdate<type>(d, value, loc, output);
+    return DoParallelConcatUpdate<CPUDevice, type>(d, value, loc, output);
     TF_CALL_NUMBER_TYPES(CASE);
     TF_CALL_string(CASE);
 #undef CASE
@@ -54,6 +55,25 @@ Status DoParallelConcat(const CPUDevice& d, const Tensor& value, int32 loc,
       return errors::InvalidArgument("Unsupported data type: ", value.dtype());
   }
 }
+
+#ifdef TENSORFLOW_USE_SYCL
+template <>
+Status DoParallelConcat(const SyclDevice& d, const Tensor& value, int32 loc,
+                        Tensor* output) {
+  CHECK_EQ(value.dtype(), output->dtype());
+  switch (value.dtype()) {
+#define CASE(type)                  \
+  case DataTypeToEnum<type>::value: \
+    return DoParallelConcatUpdate<SyclDevice, type>(d, value, loc, output);
+    TF_CALL_int32(CASE);
+    TF_CALL_float(CASE);
+    TF_CALL_double(CASE);
+#undef CASE
+    default:
+      return errors::InvalidArgument("Unsupported data type: ", value.dtype());
+  }
+}
+#endif // TENSORFLOW_USE_SYCL
 
 }  // end namespace functor
 
@@ -151,6 +171,31 @@ TF_CALL_POD_STRING_TYPES(REGISTER_EMPTY)
       FailureKernel);
 TF_CALL_POD_STRING_TYPES(REGISTER_PARALLEL_CONCAT);
 #undef REGISTER_PARALLEL_CONCAT
+
+#ifdef TENSORFLOW_USE_SYCL
+#define REGISTER(type)                                    \
+  REGISTER_KERNEL_BUILDER(Name("_ParallelConcatUpdate")   \
+                              .Device(DEVICE_SYCL)        \
+                              .TypeConstraint<type>("T"), \
+                          ParallelConcatUpdate<SyclDevice>);
+TF_CALL_POD_STRING_TYPES(REGISTER)
+#undef REGISTER
+
+#define REGISTER_EMPTY(type)                                  \
+  REGISTER_KERNEL_BUILDER(Name("_ParallelConcatStart")        \
+                              .Device(DEVICE_SYCL)            \
+                              .TypeConstraint<type>("dtype"), \
+                          ParallelConcatStart<SyclDevice, type>)
+TF_CALL_POD_STRING_TYPES(REGISTER_EMPTY)
+#undef REGISTER_EMPTY
+
+#define REGISTER_PARALLEL_CONCAT(type)                                     \
+  REGISTER_KERNEL_BUILDER(                                                 \
+      Name("ParallelConcat").Device(DEVICE_SYCL).TypeConstraint<type>("T"), \
+      FailureKernel);
+TF_CALL_POD_STRING_TYPES(REGISTER_PARALLEL_CONCAT);
+#undef REGISTER_PARALLEL_CONCAT
+#endif // TENSORFLOW_USE_SYCL
 
 #if GOOGLE_CUDA
 
