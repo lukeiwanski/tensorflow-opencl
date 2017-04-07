@@ -191,7 +191,7 @@ TF_CALL_POD_STRING_TYPES(REGISTER_DYNAMIC_STITCH_GPU);
                               .HostMemory("merged"),     \
                           DynamicStitchOp<type>)
 
-TF_CALL_POD_STRING_TYPES(REGISTER_DYNAMIC_STITCH_SYCL);
+TF_CALL_SYCL_POD_STRING_TYPES(REGISTER_DYNAMIC_STITCH_SYCL);
 #undef REGISTER_DYNAMIC_STITCH_SYCL
 #endif  // TENSORFLOW_USE_SYCL
 }  // namespace tensorflow

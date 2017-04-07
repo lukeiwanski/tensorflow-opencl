@@ -53,7 +53,7 @@ REGISTER_KERNEL_BUILDER(Name("RefIdentity").Device(DEVICE_CPU), IdentityOp);
       Name("StopGradient").Device(DEVICE_SYCL).TypeConstraint<type>("T"),    \
       IdentityOp)
 
-TF_CALL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
+TF_CALL_SYCL_REAL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
 
 #undef REGISTER_SYCL_KERNEL
 

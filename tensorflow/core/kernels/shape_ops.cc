@@ -84,7 +84,7 @@ REGISTER_KERNEL_BUILDER(Name("Shape")
                               .TypeConstraint<type>("T"),        \
                           ShapeOp<int64>);
 
-TF_CALL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
+TF_CALL_SYCL_REAL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
 
 REGISTER_KERNEL_BUILDER(Name("Shape")
                             .Device(DEVICE_SYCL)
@@ -168,7 +168,7 @@ REGISTER_KERNEL_BUILDER(Name("ShapeN")
                               .TypeConstraint<type>("T"),        \
                           ShapeNOp<int64>)
 
-TF_CALL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
+TF_CALL_SYCL_REAL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
 
 REGISTER_KERNEL_BUILDER(Name("ShapeN")
                             .Device(DEVICE_SYCL)
@@ -226,7 +226,7 @@ REGISTER_KERNEL_BUILDER(Name("Rank")
                               .TypeConstraint<type>("T") \
                               .HostMemory("output"),     \
                           RankOp);
-TF_CALL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
+TF_CALL_SYCL_REAL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
 
 REGISTER_KERNEL_BUILDER(Name("Rank")
                             .Device(DEVICE_SYCL)
@@ -306,7 +306,7 @@ REGISTER_KERNEL_BUILDER(Name("Size")
                               .TypeConstraint<int64>("out_type") \
                               .HostMemory("output"),             \
                           SizeOp<int64>);
-TF_CALL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL)
+TF_CALL_SYCL_REAL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL)
 #undef REGISTER_SYCL_KERNEL
 REGISTER_KERNEL_BUILDER(Name("Size")
                             .Device(DEVICE_SYCL)
@@ -360,7 +360,7 @@ REGISTER_KERNEL_BUILDER(Name("ExpandDims")
                               .TypeConstraint<int32>("Tdim") \
                               .HostMemory("dim"),            \
                           ExpandDimsOp);
-TF_CALL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
+TF_CALL_SYCL_REAL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
 
 REGISTER_KERNEL_BUILDER(Name("ExpandDims")
                             .Device(DEVICE_SYCL)
@@ -400,7 +400,7 @@ REGISTER_KERNEL_BUILDER(Name("Squeeze")
   REGISTER_KERNEL_BUILDER(                                          \
       Name("Squeeze").Device(DEVICE_SYCL).TypeConstraint<type>("T"),\
       SqueezeOp);
-TF_CALL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
+TF_CALL_SYCL_REAL_NUMBER_TYPES_NO_INT32(REGISTER_SYCL_KERNEL);
 #undef REGISTER_SYCL_KERNEL
 REGISTER_KERNEL_BUILDER(Name("Squeeze")
                             .Device(DEVICE_SYCL)
