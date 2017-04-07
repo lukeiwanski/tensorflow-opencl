@@ -19,7 +19,9 @@ set -e
 DOWNLOADS_DIR=tensorflow/contrib/makefile/downloads
 BZL_FILE_PATH=tensorflow/workspace.bzl
 
-EIGEN_URL="$(grep -o 'http.*bitbucket.org/eigen/eigen/get/.*tar\.gz' "${BZL_FILE_PATH}" | grep -v bazel-mirror | head -n1)"
+# Temporary fix to refer to Benoit Steiner's Eigen repository instead of mainline.
+#EIGEN_URL="$(grep -o 'http.*bitbucket.org/eigen/eigen/get/.*tar\.gz' "${BZL_FILE_PATH}" | grep -v bazel-mirror | head -n1)"
+EIGEN_URL="https://bitbucket.org/benoitsteiner/opencl/get/123510871143.tar.gz"
 GEMMLOWP_URL="$(grep -o 'http.*github.com/google/gemmlowp/.*tar\.gz' "${BZL_FILE_PATH}" | grep -v bazel-mirror | head -n1)"
 GOOGLETEST_URL="https://github.com/google/googletest/archive/release-1.8.0.tar.gz"
 PROTOBUF_URL="$(grep -o 'http.*github.com/google/protobuf/.*tar\.gz' "${BZL_FILE_PATH}" | grep -v bazel-mirror | head -n1)"
