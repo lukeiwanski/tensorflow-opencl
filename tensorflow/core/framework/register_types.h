@@ -146,9 +146,20 @@ limitations under the License.
 #define TF_CALL_REAL_NUMBER_TYPES(m) \
   TF_CALL_INTEGRAL_TYPES(m) TF_CALL_half(m) TF_CALL_float(m) TF_CALL_double(m)
 
+#ifdef TENSORFLOW_USE_SYCL
+#define TF_CALL_SYCL_REAL_NUMBER_TYPES(m) \
+  TF_CALL_INTEGRAL_TYPES(m) TF_CALL_float(m) TF_CALL_double(m)
+#endif // TENSORFLOW_USE_SYCL
+
 #define TF_CALL_REAL_NUMBER_TYPES_NO_INT32(m)                         \
   TF_CALL_half(m) TF_CALL_float(m) TF_CALL_double(m) TF_CALL_int64(m) \
       TF_CALL_uint16(m) TF_CALL_int16(m) TF_CALL_uint8(m) TF_CALL_int8(m)
+
+#ifdef TENSORFLOW_USE_SYCL
+#define TF_CALL_SYCL_REAL_NUMBER_TYPES_NO_INT32(m)                    \
+  TF_CALL_float(m) TF_CALL_double(m) TF_CALL_int64(m)                 \
+      TF_CALL_uint16(m) TF_CALL_int16(m) TF_CALL_uint8(m) TF_CALL_int8(m)
+#endif // TENSORFLOW_USE_SYCL
 
 // Call "m" for all number types, including complex64 and complex128.
 #define TF_CALL_NUMBER_TYPES(m) \
@@ -159,6 +170,10 @@ limitations under the License.
   TF_CALL_complex64(m) TF_CALL_complex128(m)
 
 #define TF_CALL_POD_TYPES(m) TF_CALL_NUMBER_TYPES(m) TF_CALL_bool(m)
+
+#ifdef TENSORFLOW_USE_SYCL
+#define TF_CALL_SYCL_POD_TYPES(m) TF_CALL_SYCL_REAL_NUMBER_TYPES(m) TF_CALL_bool(m)
+#endif // TENSORFLOW_USE_SYCL
 
 // Call "m" on all types.
 #define TF_CALL_ALL_TYPES(m) \
