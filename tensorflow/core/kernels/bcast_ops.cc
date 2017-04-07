@@ -134,7 +134,7 @@ REGISTER_KERNEL_BUILDER(Name("BroadcastArgs")
                             .HostMemory("r0"),
                         BCastArgsOp);
 
-#if TENSORFLOW_USE_SYCL
+#ifdef TENSORFLOW_USE_SYCL
 REGISTER_KERNEL_BUILDER(Name("BroadcastArgs")
                             .Device(DEVICE_SYCL)
                             .TypeConstraint<int32>("T")
@@ -142,7 +142,7 @@ REGISTER_KERNEL_BUILDER(Name("BroadcastArgs")
                             .HostMemory("s1")
                             .HostMemory("r0"),
                         BCastArgsOp);
-#endif
+#endif // TENSORFLOW_USE_SYCL
 
 REGISTER_KERNEL_BUILDER(Name("BroadcastGradientArgs")
                             .Device(DEVICE_CPU)
@@ -161,7 +161,7 @@ REGISTER_KERNEL_BUILDER(Name("BroadcastGradientArgs")
                             .HostMemory("r1"),
                         BCastGradArgsOp);
 
-#if TENSORFLOW_USE_SYCL
+#ifdef TENSORFLOW_USE_SYCL
 REGISTER_KERNEL_BUILDER(Name("BroadcastGradientArgs")
                             .Device(DEVICE_SYCL)
                             .TypeConstraint<int32>("T")
@@ -170,5 +170,5 @@ REGISTER_KERNEL_BUILDER(Name("BroadcastGradientArgs")
                             .HostMemory("r0")
                             .HostMemory("r1"),
                         BCastGradArgsOp);
-#endif
+#endif // TENSORFLOW_USE_SYCL
 }  // end namespace tensorflow

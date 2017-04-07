@@ -75,7 +75,7 @@ REGISTER_GPU_KERNEL(bool);
                               .TypeConstraint<type>("T"), \
                           GetSessionHandleOp)
 
-TF_CALL_NUMBER_TYPES(REGISTER_SYCL_KERNEL);
+TF_CALL_SYCL_REAL_NUMBER_TYPES(REGISTER_SYCL_KERNEL);
 REGISTER_SYCL_KERNEL(bool);
 #undef REGISTER_SYCL_KERNEL
 #endif // TENSORFLOW_USE_SYCL
@@ -118,7 +118,7 @@ REGISTER_GPU_KERNEL(bool);
                               .TypeConstraint<type>("dtype"), \
                           GetSessionTensorOp)
 
-TF_CALL_NUMBER_TYPES(REGISTER_SYCL_KERNEL);
+TF_CALL_SYCL_REAL_NUMBER_TYPES(REGISTER_SYCL_KERNEL);
 REGISTER_SYCL_KERNEL(bool);
 #undef REGISTER_SYCL_KERNEL
 #endif // TENSORFLOW_USE_SYCL
