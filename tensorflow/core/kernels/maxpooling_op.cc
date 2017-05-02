@@ -530,6 +530,7 @@ class MaxPoolBackwardNoMaskNHWC {
       // Atomically accumulate the bottom diff. The index could still be
       // uninitialized, if all the bottom_data are NaN.
       if (maxidx != -1) {
+        // TODO make atomic
         *(bottom_diff + n * height_ * width_ * channels_ + maxidx) += top_diff[index];
       }
     }
@@ -1276,6 +1277,7 @@ public:
     dtype* bottom_diff = ConvertToActualTypeSycl(dtype, bottom_diff_);
     for (int index = item.get_global(0); index < nthreads_; index += item.get_num_groups(0) * item.get_local_range()[0]) {
       int image_id = (index / top_offset_);
+      // TODO make atomic
       *(bottom_diff + image_id * bottom_offset_ + mask[index]) += top_diff[index];
     }
   }
