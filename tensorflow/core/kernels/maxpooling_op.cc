@@ -448,9 +448,8 @@ REGISTER_KERNEL_BUILDER(
 
 using namespace cl;
 
-template <typename dtype>
+template <typename dtype, typename write_accessor>
 class SetZero {
-  using write_accessor = sycl::accessor<uint8_t, 1, sycl::access::mode::write, sycl::access::target::global_buffer>;
 public:
   SetZero(const int nthreads, write_accessor bottom_diff_access)
       :nthreads_(nthreads)
@@ -469,9 +468,25 @@ private:
   write_accessor bottom_diff_access_;
 };
 
+template <typename BinaryOperation>
+void SyclAtomicOperation(cl::sycl::atomic<uint32_t> element, float value) {
+  union {
+    uint32_t u32;
+    float f32;
+  } next, expected;
+
+  BinaryOperation operation;
+  expected.u32 = element.load();
+  do {
+    next.f32 = operation(expected.f32, value);
+  } while (element.compare_exchange_strong(expected.u32, next.u32,
+           std::memory_order_relaxed,
+           std::memory_order_relaxed));
+}
+
 template <typename dtype>
 class MaxPoolBackwardNoMaskNHWC {
-  using atomic_accessor = sycl::accessor<uint8_t, 1, sycl::access::mode::atomic, sycl::access::target::global_buffer>;
+  using atomic_accessor = sycl::accessor<uint32_t, 1, sycl::access::mode::atomic, sycl::access::target::global_buffer>;
   using read_accessor = sycl::accessor<uint8_t, 1, sycl::access::mode::read, sycl::access::target::global_buffer>;
  public:
   MaxPoolBackwardNoMaskNHWC(const int nthreads, read_accessor bottom_data, const int height,
@@ -499,7 +514,6 @@ class MaxPoolBackwardNoMaskNHWC {
   void operator()(sycl::nd_item<1> item) {
     const dtype* bottom_data = ConvertToActualTypeSycl(dtype, bottom_data_);
     const dtype* top_diff = ConvertToActualTypeSycl(dtype, top_diff_);
-    dtype* bottom_diff = ConvertToActualTypeSycl(dtype, bottom_diff_);
 
     for (int index = item.get_global(0); index < nthreads_; index += item.get_global_range(0)) {
       // First find out the index to the maximum, since we have no mask.
@@ -530,8 +544,7 @@ class MaxPoolBackwardNoMaskNHWC {
       // Atomically accumulate the bottom diff. The index could still be
       // uninitialized, if all the bottom_data are NaN.
       if (maxidx != -1) {
-        // TODO make atomic
-        *(bottom_diff + n * height_ * width_ * channels_ + maxidx) += top_diff[index];
+        SyclAtomicOperation<std::plus<dtype>>(bottom_diff_[n * height_ * width_ * channels_ + maxidx], top_diff[index]);
       }
     }
   }
@@ -567,13 +580,19 @@ bool MaxPoolBackwardNoMask(const float* bottom_data, const int batch,
   const int bottom_size = batch * channels * height * width;
   const int top_size = batch * channels * pooled_height * pooled_width;
 
-  auto bottom_diff_buffer = d.get_sycl_buffer(bottom_diff);
+  auto& bottom_diff_buffer_bytes = d.get_sycl_buffer(bottom_diff);
+  sycl::buffer<uint32_t, 1> bottom_diff_buffer(
+    reinterpret_cast<sycl::buffer<uint32_t, 1, cl::sycl::default_allocator<uint32_t>> &>(bottom_diff_buffer_bytes),
+    sycl::id<1>(0),
+    sycl::range<1>(bottom_diff_buffer_bytes.get_size() / sizeof(uint32_t))
+  );
+
   auto bottom_data_buffer = d.get_sycl_buffer(bottom_data);
   auto top_diff_buffer = d.get_sycl_buffer(top_diff);
 
   d.sycl_queue().submit([&](sycl::handler& cgh) {
     auto bottom_diff_access = bottom_diff_buffer.template get_access<sycl::access::mode::write>(cgh);
-    SetZero<float> set_zero(bottom_size, bottom_diff_access);
+    SetZero<float, decltype(bottom_diff_access)> set_zero(bottom_size, bottom_diff_access);
 
     const size_t group_count = (bottom_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
     cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
@@ -586,51 +605,6 @@ bool MaxPoolBackwardNoMask(const float* bottom_data, const int batch,
     auto bottom_diff_access = bottom_diff_buffer.template get_access<sycl::access::mode::atomic>(cgh);
     auto top_diff_access = top_diff_buffer.template get_access<sycl::access::mode::read>(cgh);
     MaxPoolBackwardNoMaskNHWC<float> maxPoolBackward(
-      top_size, bottom_data_access, height, width, channels, pooled_height,
-      pooled_width, kernel_h, kernel_w, stride_h, stride_w, pad_t, pad_l,
-      top_diff_access, bottom_diff_access
-    );
-
-    const size_t group_count = (top_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
-    cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
-      maxPoolBackward
-    );
-  });
-
-  return d.ok();
-}
-
-bool MaxPoolBackwardNoMask(const Eigen::half* bottom_data, const int batch,
-                           const int height, const int width,
-                           const int channels, const int pooled_height,
-                           const int pooled_width, const int kernel_h,
-                           const int kernel_w, const int stride_h,
-                           const int stride_w, const int pad_t, const int pad_l,
-                           const Eigen::half* top_diff, Eigen::half* bottom_diff,
-                           const Eigen::SyclDevice& d) {
-  const int kThreadsPerBlock = 1024;
-  const int bottom_size = batch * channels * height * width;
-  const int top_size = batch * channels * pooled_height * pooled_width;
-
-  auto bottom_diff_buffer = d.get_sycl_buffer(bottom_diff);
-  auto bottom_data_buffer = d.get_sycl_buffer(bottom_data);
-  auto top_diff_buffer = d.get_sycl_buffer(top_diff);
-
-  d.sycl_queue().submit([&](sycl::handler& cgh) {
-    auto bottom_diff_access = bottom_diff_buffer.template get_access<sycl::access::mode::write>(cgh);
-    const size_t group_count = (bottom_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
-
-    SetZero<Eigen::half> set_zero(bottom_size, bottom_diff_access);
-    cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
-      set_zero
-    );
-  });
-
-  d.sycl_queue().submit([&](sycl::handler& cgh) {
-    auto bottom_data_access = bottom_data_buffer.template get_access<sycl::access::mode::read>(cgh);
-    auto bottom_diff_access = bottom_diff_buffer.template get_access<sycl::access::mode::atomic>(cgh);
-    auto top_diff_access = top_diff_buffer.template get_access<sycl::access::mode::read>(cgh);
-    MaxPoolBackwardNoMaskNHWC<Eigen::half> maxPoolBackward(
       top_size, bottom_data_access, height, width, channels, pooled_height,
       pooled_width, kernel_h, kernel_w, stride_h, stride_w, pad_t, pad_l,
       top_diff_access, bottom_diff_access
@@ -730,9 +704,6 @@ class MaxPoolingGradOp<Eigen::SyclDevice, T> : public OpKernel {
 REGISTER_KERNEL_BUILDER(
     Name("MaxPoolGrad").Device(DEVICE_SYCL).TypeConstraint<float>("T"),
     MaxPoolingGradOp<Eigen::SyclDevice, float>);
-REGISTER_KERNEL_BUILDER(
-    Name("MaxPoolGrad").Device(DEVICE_SYCL).TypeConstraint<Eigen::half>("T"),
-    MaxPoolingGradOp<Eigen::SyclDevice, Eigen::half>);
 
 #endif  // TENSORFLOW_USE_SYCL
 
@@ -1257,7 +1228,7 @@ bool MaxPoolForwardWithOptionalArgmax(
 
 template <typename dtype, typename mask_dtype>
 class MaxPoolBackward {
-  using atomic_accessor = sycl::accessor<uint8_t, 1, sycl::access::mode::atomic, sycl::access::target::global_buffer>;
+  using atomic_accessor = sycl::accessor<uint32_t, 1, sycl::access::mode::atomic, sycl::access::target::global_buffer>;
   using read_accessor = sycl::accessor<uint8_t, 1, sycl::access::mode::read, sycl::access::target::global_buffer>;
 public:
   MaxPoolBackward(const int nthreads, read_accessor top_diff,
@@ -1274,11 +1245,9 @@ public:
   void operator()(sycl::nd_item<1> item) {
     const dtype* top_diff = ConvertToActualTypeSycl(dtype, top_diff_);
     const mask_dtype* mask = ConvertToActualTypeSycl(mask_dtype, mask_);
-    dtype* bottom_diff = ConvertToActualTypeSycl(dtype, bottom_diff_);
     for (int index = item.get_global(0); index < nthreads_; index += item.get_num_groups(0) * item.get_local_range()[0]) {
       int image_id = (index / top_offset_);
-      // TODO make atomic
-      *(bottom_diff + image_id * bottom_offset_ + mask[index]) += top_diff[index];
+      SyclAtomicOperation<std::plus<dtype>>(bottom_diff_[image_id * bottom_offset_ + mask[index]], top_diff[index]);
     }
   }
 
@@ -1298,13 +1267,19 @@ bool MaxPoolBackwardWithArgmax(const int output_size, const int input_size,
 
   const int kThreadsPerBlock = 1024;
 
-  auto bottom_buffer = d.get_sycl_buffer(bottom_diff);
+  auto& bottom_buffer_bytes = d.get_sycl_buffer(bottom_diff);
+  sycl::buffer<uint32_t, 1> bottom_buffer(
+    reinterpret_cast<sycl::buffer<uint32_t, 1, cl::sycl::default_allocator<uint32_t>> &>(bottom_buffer_bytes),
+    sycl::id<1>(0),
+    sycl::range<1>(bottom_buffer_bytes.get_size() / sizeof(uint32_t))
+  );
+
   d.sycl_queue().submit([&](sycl::handler& cgh) {
     auto bottom_access = bottom_buffer.template get_access<sycl::access::mode::write>(cgh);
-    SetZero<float> setZero(input_size, bottom_access);
+    SetZero<float, decltype(bottom_access)> setZero(input_size, bottom_access);
 
     const size_t group_count = (input_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
-    cgh.parallel_for<class SetZero<float>>(
+    cgh.parallel_for<class SetZero<float, decltype(bottom_access)>>(
       sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
       setZero
     );
@@ -1312,6 +1287,7 @@ bool MaxPoolBackwardWithArgmax(const int output_size, const int input_size,
 
   auto mask_buffer = d.get_sycl_buffer(mask);
   auto top_diff_buffer = d.get_sycl_buffer(top_diff);
+
   d.sycl_queue().submit([&](sycl::handler& cgh) {
     auto bottom_access = bottom_buffer.template get_access<sycl::access::mode::atomic>(cgh);
     auto mask_access = mask_buffer.template get_access<sycl::access::mode::read>(cgh);
@@ -1322,45 +1298,6 @@ bool MaxPoolBackwardWithArgmax(const int output_size, const int input_size,
     cgh.parallel_for<class MaxPoolBackward<float, int64>>(
       sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
       maxPoolBackward
-    );
-  });
-
-  return d.ok();
-}
-
-bool MaxPoolBackwardWithArgmax(const int output_size, const int input_size,
-                               const Eigen::half* top_diff, const int64* mask,
-                               const int top_offset, const int bottom_offset,
-                               Eigen::half* bottom_diff,
-                               const Eigen::SyclDevice& d) {
-
-  const int kThreadsPerBlock = 1024;
-
-  auto bottom_buffer = d.get_sycl_buffer(bottom_diff);
-  d.sycl_queue().submit([&](sycl::handler& cgh) {
-    auto bottom_access = bottom_buffer.template get_access<sycl::access::mode::write>(cgh);
-    SetZero<Eigen::half> setZero(input_size, bottom_access);
-
-    const size_t group_count = (input_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
-    cgh.parallel_for<class SetZero<Eigen::half>>(
-      sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
-      setZero
-    );
-  });
-
-  auto mask_buffer = d.get_sycl_buffer(mask);
-  auto top_diff_buffer = d.get_sycl_buffer(top_diff);
-  d.sycl_queue().submit([&](sycl::handler& cgh) {
-    auto bottom_access = bottom_buffer.template get_access<sycl::access::mode::atomic>(cgh);
-    auto mask_access = mask_buffer.template get_access<sycl::access::mode::read>(cgh);
-    auto top_access = top_diff_buffer.template get_access<sycl::access::mode::read>(cgh);
-    MaxPoolBackward<Eigen::half, int64> maxPollBackward(output_size, top_access, mask_access, top_offset, bottom_offset, bottom_access);
-
-
-    const size_t group_count = (output_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
-    cgh.parallel_for<class MaxPoolBackward<Eigen::half, int64>>(
-      sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
-      maxPollBackward
     );
   });
 
@@ -1387,9 +1324,6 @@ struct LaunchMaxPoolingNoMask<Eigen::SyclDevice, T> {
 REGISTER_KERNEL_BUILDER(
     Name("MaxPool").Device(DEVICE_SYCL).TypeConstraint<float>("T"),
     MaxPoolingNoMaskOp<Eigen::SyclDevice, float>);
-REGISTER_KERNEL_BUILDER(
-    Name("MaxPool").Device(DEVICE_SYCL).TypeConstraint<Eigen::half>("T"),
-    MaxPoolingNoMaskOp<Eigen::SyclDevice, Eigen::half>);
 
 template <typename T>
 struct LaunchMaxPoolingWithArgmax<Eigen::SyclDevice, T> {
@@ -1415,11 +1349,6 @@ REGISTER_KERNEL_BUILDER(Name("MaxPoolWithArgmax")
                             .TypeConstraint<int64>("Targmax")
                             .TypeConstraint<float>("T"),
                         MaxPoolingWithArgmaxOp<Eigen::SyclDevice, float>);
-REGISTER_KERNEL_BUILDER(Name("MaxPoolWithArgmax")
-                            .Device(DEVICE_SYCL)
-                            .TypeConstraint<int64>("Targmax")
-                            .TypeConstraint<Eigen::half>("T"),
-                        MaxPoolingWithArgmaxOp<Eigen::SyclDevice, Eigen::half>);
 
 template <typename T>
 struct LaunchMaxPoolingGradWithArgmax<Eigen::SyclDevice, T> {
@@ -1450,12 +1379,6 @@ REGISTER_KERNEL_BUILDER(
         .TypeConstraint<float>("T")
         .TypeConstraint<int64>("Targmax"),
     MaxPoolingGradWithArgmaxOp<Eigen::SyclDevice, float>);
-REGISTER_KERNEL_BUILDER(
-    Name("MaxPoolGradWithArgmax")
-        .Device(DEVICE_SYCL)
-        .TypeConstraint<Eigen::half>("T")
-        .TypeConstraint<int64>("Targmax"),
-    MaxPoolingGradWithArgmaxOp<Eigen::SyclDevice, Eigen::half>);
 
 #endif  // TENSORFLOW_USE_SYCL
 
