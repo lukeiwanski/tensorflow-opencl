@@ -43,6 +43,10 @@ limitations under the License.
 #include "tensorflow/core/platform/stream_executor.h"
 #endif  // GOOGLE_CUDA
 
+#if TENSORFLOW_USE_SYCL
+#include "tensorflow/core/util/sycl_kernel_helper.h"
+#endif
+
 namespace tensorflow {
 
 typedef Eigen::ThreadPoolDevice CPUDevice;
@@ -220,6 +224,34 @@ REGISTER_KERNEL_BUILDER(Name("MaxPool")
                             .Label("eigen_tensor"),
                         MaxPoolingOp<Eigen::GpuDevice, float>);
 #endif  // GOOGLE_CUDA
+
+
+#if TENSORFLOW_USE_SYCL
+
+namespace functor {
+#define DECLARE_SYCL_SPEC(T)                                           \
+  template <>                                                          \
+  void SpatialMaxPooling<Eigen::SyclDevice, T>::operator()(            \
+      const Eigen::SyclDevice& d, typename TTypes<T, 4>::Tensor output,\
+      typename TTypes<T, 4>::ConstTensor input, int window_rows,       \
+      int window_cols, int row_stride, int col_stride,                 \
+      const Eigen::PaddingType& padding) {}
+
+DECLARE_SYCL_SPEC(float);
+#undef DECLARE_SYCL_SPEC
+}  // namespace functor
+
+// Note(jiayq): Currently, the Caffe custom implementation is faster than the
+// default Eigen implementation so we are using the custom kernel as the
+// default. However, you can explicitly invoke the eigen version using
+// kernel_label_map.
+REGISTER_KERNEL_BUILDER(Name("MaxPool")
+                            .Device(DEVICE_SYCL)
+                            .TypeConstraint<float>("T")
+                            .Label("eigen_tensor"),
+                        MaxPoolingOp<Eigen::SyclDevice, float>);
+#endif  // TENSORFLOW_USE_SYCL
+
 
 // The operation to compute MaxPool gradients.
 // It takes three inputs:
@@ -415,6 +447,233 @@ REGISTER_KERNEL_BUILDER(
     MaxPoolingGradOp<Eigen::GpuDevice, Eigen::half>);
 
 #endif  // GOOGLE_CUDA
+
+#ifdef TENSORFLOW_USE_SYCL
+
+using namespace cl;
+
+template <typename dtype>
+class MaxPoolBackwardNoMaskNHWC {
+  using atomic_accessor = sycl::accessor<uint32_t, 1, sycl::access::mode::atomic, sycl::access::target::global_buffer>;
+  using read_accessor = sycl::accessor<uint8_t, 1, sycl::access::mode::read, sycl::access::target::global_buffer>;
+ public:
+  MaxPoolBackwardNoMaskNHWC(const int nthreads, read_accessor bottom_data, const int height,
+                            const int width, const int channels, const int pooled_height,
+                            const int pooled_width, const int kernel_h, const int kernel_w,
+                            const int stride_h, const int stride_w, const int pad_t, const int pad_l,
+                            read_accessor top_diff, atomic_accessor bottom_diff)
+      :nthreads_(nthreads)
+      ,bottom_data_(bottom_data)
+      ,height_(height)
+      ,width_(width)
+      ,channels_(channels)
+      ,pooled_height_(pooled_height)
+      ,pooled_width_(pooled_width)
+      ,kernel_h_(kernel_h)
+      ,kernel_w_(kernel_w)
+      ,stride_h_(stride_h)
+      ,stride_w_(stride_w)
+      ,pad_t_(pad_t)
+      ,pad_l_(pad_l)
+      ,top_diff_(top_diff)
+      ,bottom_diff_(bottom_diff) {
+  }
+
+  void operator()(sycl::nd_item<1> item) {
+    const dtype* bottom_data = ConvertToActualTypeSycl(dtype, bottom_data_);
+    const dtype* top_diff = ConvertToActualTypeSycl(dtype, top_diff_);
+
+    for (int index = item.get_global(0); index < nthreads_; index += item.get_global_range(0)) {
+      // First find out the index to the maximum, since we have no mask.
+      int n = index;
+      int c = n % channels_;
+      n /= channels_;
+      int wstart = (n % pooled_width_) * stride_w_ - pad_l_;
+      n /= pooled_width_;
+      int hstart = (n % pooled_height_) * stride_h_ - pad_t_;
+      n /= pooled_height_;
+      int hend = std::min(hstart + kernel_h_, height_);
+      int wend = std::min(wstart + kernel_w_, width_);
+      hstart = std::max(hstart, 0);
+      wstart = std::max(wstart, 0);
+      dtype maxval = Eigen::NumTraits<dtype>::lowest();
+      int maxidx = -1;
+      const dtype* bottom_data_n = bottom_data + n * height_ * width_ * channels_;
+      for (int h = hstart; h < hend; ++h) {
+        for (int w = wstart; w < wend; ++w) {
+          int idx = (h * width_ + w) * channels_ + c;
+          if (bottom_data_n[idx] > maxval) {
+            maxidx = idx;
+            maxval = bottom_data_n[idx];
+          }
+        }
+      }
+
+      // Atomically accumulate the bottom diff. The index could still be
+      // uninitialized, if all the bottom_data are NaN.
+      if (maxidx != -1) {
+        SyclAtomicOperation<std::plus<dtype>>(bottom_diff_[n * height_ * width_ * channels_ + maxidx],
+                                              top_diff[index]);
+      }
+    }
+  }
+
+private:
+  const int nthreads_;
+  read_accessor bottom_data_;
+  const int height_;
+  const int width_;
+  const int channels_;
+  const int pooled_height_;
+  const int pooled_width_;
+  const int kernel_h_;
+  const int kernel_w_;
+  const int stride_h_;
+  const int stride_w_;
+  const int pad_t_;
+  const int pad_l_;
+  read_accessor top_diff_;
+  atomic_accessor bottom_diff_;
+};
+
+bool MaxPoolBackwardNoMask(const float* bottom_data, const int batch,
+                           const int height, const int width,
+                           const int channels, const int pooled_height,
+                           const int pooled_width, const int kernel_h,
+                           const int kernel_w, const int stride_h,
+                           const int stride_w, const int pad_t, const int pad_l,
+                           const float* top_diff, float* bottom_diff,
+                           const Eigen::SyclDevice& d) {
+  const int kThreadsPerBlock = 1024;
+  const int bottom_size = batch * channels * height * width;
+  const int top_size = batch * channels * pooled_height * pooled_width;
+
+  auto& bottom_diff_buffer_bytes = d.get_sycl_buffer(bottom_diff);
+  sycl::buffer<uint32_t, 1> bottom_diff_buffer(
+    reinterpret_cast<sycl::buffer<uint32_t, 1, cl::sycl::default_allocator<uint32_t>> &>(bottom_diff_buffer_bytes),
+    sycl::id<1>(0),
+    sycl::range<1>(bottom_diff_buffer_bytes.get_size() / sizeof(uint32_t))
+  );
+
+  auto bottom_data_buffer = d.get_sycl_buffer(bottom_data);
+  auto top_diff_buffer = d.get_sycl_buffer(top_diff);
+
+  d.sycl_queue().submit([&](sycl::handler& cgh) {
+    auto bottom_diff_access = bottom_diff_buffer.template get_access<sycl::access::mode::write>(cgh);
+    SetZero<float, decltype(bottom_diff_access)> set_zero(bottom_size, bottom_diff_access);
+
+    const size_t group_count = (bottom_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
+      set_zero
+    );
+  });
+
+  d.sycl_queue().submit([&](sycl::handler& cgh) {
+    auto bottom_data_access = bottom_data_buffer.template get_access<sycl::access::mode::read>(cgh);
+    auto bottom_diff_access = bottom_diff_buffer.template get_access<sycl::access::mode::atomic>(cgh);
+    auto top_diff_access = top_diff_buffer.template get_access<sycl::access::mode::read>(cgh);
+    MaxPoolBackwardNoMaskNHWC<float> maxPoolBackward(
+      top_size, bottom_data_access, height, width, channels, pooled_height,
+      pooled_width, kernel_h, kernel_w, stride_h, stride_w, pad_t, pad_l,
+      top_diff_access, bottom_diff_access
+    );
+
+    const size_t group_count = (top_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
+      maxPoolBackward
+    );
+  });
+
+  return d.ok();
+}
+
+template <typename T>
+static void MaxPoolingBackwardCustomKernel(
+    OpKernelContext* context, const std::vector<int32>& size,
+    const std::vector<int32>& stride, Padding padding, const Tensor* tensor_in,
+    const Tensor& out_backprop, const TensorShape& tensor_in_shape) {
+  Tensor* output = nullptr;
+  if (!context->forward_input_to_output(0, 0, &output)) {
+    OP_REQUIRES_OK(context,
+                   context->allocate_output(0, tensor_in_shape, &output));
+  }
+
+  PoolParameters params{context, size,        stride,
+                        padding, FORMAT_NHWC, tensor_in_shape};
+  if (!context->status().ok()) {
+    return;
+  }
+
+  MaxPoolBackwardNoMask(
+      tensor_in->flat<T>().data(), params.tensor_in_batch,
+      params.tensor_in_rows, params.tensor_in_cols, params.depth,
+      params.out_height, params.out_width, params.window_rows,
+      params.window_cols, params.row_stride, params.col_stride, params.pad_rows,
+      params.pad_cols, out_backprop.flat<T>().data(),
+      output->flat<T>().data(), context->eigen_device<Eigen::SyclDevice>());
+}
+
+template <class T>
+class MaxPoolingGradOp<Eigen::SyclDevice, T> : public OpKernel {
+ public:
+  typedef Eigen::SyclDevice Device;
+
+  explicit MaxPoolingGradOp(OpKernelConstruction* context) : OpKernel(context) {
+    string data_format;
+    OP_REQUIRES_OK(context, context->GetAttr("data_format", &data_format));
+    OP_REQUIRES(context, FormatFromString(data_format, &data_format_),
+                errors::InvalidArgument("Invalid data format"));
+    OP_REQUIRES_OK(context, context->GetAttr("ksize", &ksize_));
+    OP_REQUIRES(context, ksize_.size() == 4,
+                errors::InvalidArgument("Sliding window ksize field must "
+                                        "specify 4 dimensions"));
+    OP_REQUIRES_OK(context, context->GetAttr("strides", &stride_));
+    OP_REQUIRES(context, stride_.size() == 4,
+                errors::InvalidArgument("Sliding window strides field must "
+                                        "specify 4 dimensions"));
+    OP_REQUIRES_OK(context, context->GetAttr("padding", &padding_));
+    const int32 ksize_n = GetTensorDim(ksize_, data_format_, 'N');
+    const int32 stride_n = GetTensorDim(stride_, data_format_, 'N');
+    OP_REQUIRES(context, ksize_n == 1 && stride_n == 1,
+                errors::Unimplemented(
+                    "Pooling is not yet supported on the batch dimension."));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    const Tensor& tensor_in = context->input(0);
+    const Tensor& tensor_out = context->input(1);
+    const Tensor& out_backprop = context->input(2);
+
+    // For maxpooling, tensor_in should have 4 dimensions.
+    OP_REQUIRES(context, tensor_in.dims() == 4,
+                errors::InvalidArgument("tensor_in must be 4-dimensional 4"));
+    OP_REQUIRES(context, tensor_out.dims() == 4,
+                errors::InvalidArgument("tensor_out must be 4-dimensional"));
+    // For maxpooling, out_backprop should have 4 dimensions.
+    OP_REQUIRES(context, out_backprop.dims() == 4,
+                errors::InvalidArgument("out_backprop must be 4-dimensional"));
+
+    TensorShape output_shape = tensor_in.shape();
+
+    CHECK(data_format_ == FORMAT_NHWC)
+        << "SYCL MaxPoolGrad only supports NHWC format";
+    MaxPoolingBackwardCustomKernel<T>(context, ksize_, stride_, padding_,
+                                    &tensor_in, out_backprop, output_shape);
+
+  }
+
+ private:
+  std::vector<int32> ksize_;
+  std::vector<int32> stride_;
+  Padding padding_;
+  TensorFormat data_format_;
+};
+
+REGISTER_KERNEL_BUILDER(
+    Name("MaxPoolGrad").Device(DEVICE_SYCL).TypeConstraint<float>("T"),
+    MaxPoolingGradOp<Eigen::SyclDevice, float>);
+
+#endif  // TENSORFLOW_USE_SYCL
 
 template <typename Device, typename T>
 struct LaunchMaxPoolingNoMask;
@@ -721,5 +980,375 @@ REGISTER_KERNEL_BUILDER(
     MaxPoolingGradWithArgmaxOp<Eigen::GpuDevice, Eigen::half>);
 
 #endif  // GOOGLE_CUDA
+
+#if TENSORFLOW_USE_SYCL
+typedef Eigen::SyclDevice SYCLDevice;
+
+template <typename T>
+class MaxPoolingNoMaskOp<SYCLDevice, T> : public OpKernel {
+ public:
+  typedef SYCLDevice Device;
+  explicit MaxPoolingNoMaskOp(OpKernelConstruction* context)
+      : OpKernel(context) {
+    string data_format;
+    OP_REQUIRES_OK(context, context->GetAttr("data_format", &data_format));
+    OP_REQUIRES(context, FormatFromString(data_format, &data_format_),
+                errors::InvalidArgument("Invalid data format"));
+    OP_REQUIRES_OK(context, context->GetAttr("ksize", &ksize_));
+    OP_REQUIRES(context, ksize_.size() == 4,
+                errors::InvalidArgument("Sliding window ksize field must "
+                                        "specify 4 dimensions"));
+    OP_REQUIRES_OK(context, context->GetAttr("strides", &stride_));
+    OP_REQUIRES(context, stride_.size() == 4,
+                errors::InvalidArgument("Sliding window stride field must "
+                                        "specify 4 dimensions"));
+    OP_REQUIRES_OK(context, context->GetAttr("padding", &padding_));
+    const int32 ksize_n = GetTensorDim(ksize_, data_format_, 'N');
+    const int32 stride_n = GetTensorDim(stride_, data_format_, 'N');
+    OP_REQUIRES(context, ksize_n == 1 && stride_n == 1,
+                errors::Unimplemented(
+                    "Pooling is not yet supported on the batch dimension."));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    const Tensor& tensor_in = context->input(0);
+
+    PoolParameters params{context,  ksize_,       stride_,
+                          padding_, data_format_, tensor_in.shape()};
+    if (!context->status().ok()) {
+      return;
+    }
+
+    TensorShape out_shape =
+        ShapeFromFormat(data_format_, params.tensor_in_batch, params.out_height,
+                        params.out_width, params.depth);
+
+    CHECK(data_format_ == FORMAT_NHWC)
+        << "SYCL MaxPool only supports NHWC format";
+    Tensor* output = nullptr;
+    OP_REQUIRES_OK(context, context->allocate_output(0, out_shape, &output));
+    LaunchMaxPoolingNoMask<Device, T>::launch(context, params, tensor_in,
+                                              output);
+  }
+
+ private:
+  std::vector<int32> ksize_;
+  std::vector<int32> stride_;
+  Padding padding_;
+  TensorFormat data_format_;
+};
+
+template <typename dtype, typename mask_dtype>
+class MaxPoolForwardNHWC {
+  using write_accessor = sycl::accessor<uint8_t, 1, sycl::access::mode::write, sycl::access::target::global_buffer>;
+  using read_accessor = sycl::accessor<uint8_t, 1, sycl::access::mode::read, sycl::access::target::global_buffer>;
+ public:
+  MaxPoolForwardNHWC(const int nthreads, read_accessor bottom_data,
+                     const int height, const int width,
+                     const int channels, const int pooled_height,
+                     const int pooled_width, const int kernel_h,
+                     const int kernel_w, const int stride_h,
+                     const int stride_w, const int pad_t,
+                     const int pad_l, write_accessor top_data,
+                     write_accessor mask)
+      :nthreads_(nthreads)
+      ,bottom_data_(bottom_data)
+      ,height_(height)
+      ,width_(width)
+      ,channels_(channels)
+      ,pooled_height_(pooled_height)
+      ,pooled_width_(pooled_width)
+      ,kernel_h_(kernel_h)
+      ,kernel_w_(kernel_w)
+      ,stride_h_(stride_h)
+      ,stride_w_(stride_w)
+      ,pad_t_(pad_t)
+      ,pad_l_(pad_l)
+      ,top_data_(top_data)
+      ,mask_(mask) {
+  }
+
+  void operator()(sycl::nd_item<1> item) {
+    dtype* bottom_data = ConvertToActualTypeSycl(dtype, bottom_data_);
+    dtype* top_data = ConvertToActualTypeSycl(dtype, top_data_);
+    mask_dtype* mask = ConvertToActualTypeSycl(mask_dtype, mask_);
+
+    for (int index = item.get_global(0); index < nthreads_; index += item.get_global_range(0)) {
+      int n = index;
+      int c = n % channels_;
+      n /= channels_;
+      int wstart = (n % pooled_width_) * stride_w_ - pad_l_;
+      n /= pooled_width_;
+      int hstart = (n % pooled_height_) * stride_h_ - pad_t_;
+      n /= pooled_height_;
+      int hend = std::min(hstart + kernel_h_, height_);
+      int wend = std::min(wstart + kernel_w_, width_);
+      hstart = std::max(hstart, 0);
+      wstart = std::max(wstart, 0);
+      dtype maxval = Eigen::NumTraits<dtype>::lowest();
+      int maxidx = -1;
+      const dtype* bottom_data_n = bottom_data + n * height_ * width_ * channels_;
+      for (int h = hstart; h < hend; ++h) {
+        for (int w = wstart; w < wend; ++w) {
+          int idx = (h * width_ + w) * channels_ + c;
+          if (bottom_data_n[idx] > maxval) {
+            maxidx = idx;
+            maxval = bottom_data_n[idx];
+          }
+        }
+      }
+      top_data[index] = maxval;
+      if (mask != nullptr) {
+        mask[index] = maxidx;
+      }
+    }
+  }
+
+ private:
+  const int nthreads_;
+  read_accessor bottom_data_;
+  const int height_;
+  const int width_;
+  const int channels_;
+  const int pooled_height_;
+  const int pooled_width_;
+  const int kernel_h_;
+  const int kernel_w_;
+  const int stride_h_;
+  const int stride_w_;
+  const int pad_t_;
+  const int pad_l_;
+  write_accessor top_data_;
+  write_accessor mask_;
+};
+
+// Run the forward pass of max pooling, optionally writing the argmax indices to
+// the mask array, if it is not nullptr. If mask is passed in as nullptr, the
+// argmax indices are not written.
+bool MaxPoolForwardWithOptionalArgmax(
+    const float* bottom_data, const int batch, const int height,
+    const int width, const int channels, const int pooled_height,
+    const int pooled_width, const int kernel_h, const int kernel_w,
+    const int stride_h, const int stride_w, const int pad_t, const int pad_l,
+    float* top_data, int64* mask, const Eigen::SyclDevice& device)
+{
+  const int kThreadsPerBlock = 1024;
+  const int output_size = batch * channels * pooled_height * pooled_width;
+
+  auto bottom_buffer = device.get_sycl_buffer(bottom_data);
+  auto top_buffer = device.get_sycl_buffer(top_data);
+  auto mask_buffer = device.get_sycl_buffer(mask);
+
+  device.sycl_queue().submit([&](sycl::handler& cgh) {
+    auto bottom_access = bottom_buffer.template get_access<sycl::access::mode::read>(cgh);
+    auto top_access = bottom_buffer.template get_access<sycl::access::mode::write>(cgh);
+    auto mask_access = mask_buffer.template get_access<sycl::access::mode::write>(cgh);
+    MaxPoolForwardNHWC<float, int64> maxPool(
+      output_size, bottom_access, height, width, channels, pooled_height,
+      pooled_width, kernel_h, kernel_w, stride_h, stride_w, pad_t, pad_l,
+      top_access, mask_access
+    );
+
+    const size_t group_count = (output_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    cgh.parallel_for<class MaxPoolForwardNHWC<float, int64>>(
+      sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
+      maxPool
+    );
+  });
+
+  return device.ok();
+}
+
+bool MaxPoolForwardWithOptionalArgmax(
+    const Eigen::half* bottom_data, const int batch, const int height,
+    const int width, const int channels, const int pooled_height,
+    const int pooled_width, const int kernel_h, const int kernel_w,
+    const int stride_h, const int stride_w, const int pad_t, const int pad_l,
+    Eigen::half* top_data, int64* mask, const Eigen::SyclDevice& device) {
+
+  const int kThreadsPerBlock = 1024;
+  const int output_size = batch * channels * pooled_height * pooled_width;
+
+  auto bottom_buffer = device.get_sycl_buffer(bottom_data);
+  auto top_buffer = device.get_sycl_buffer(top_data);
+  auto mask_buffer = device.get_sycl_buffer(mask);
+
+  device.sycl_queue().submit([&](sycl::handler& cgh) {
+    auto bottom_access = bottom_buffer.template get_access<sycl::access::mode::read>(cgh);
+    auto top_access = bottom_buffer.template get_access<sycl::access::mode::write>(cgh);
+    auto mask_access = mask_buffer.template get_access<sycl::access::mode::write>(cgh);
+
+    MaxPoolForwardNHWC<Eigen::half, int64> maxPool(
+      output_size, bottom_access, height, width, channels, pooled_height,
+      pooled_width, kernel_h, kernel_w, stride_h, stride_w, pad_t, pad_l,
+      top_access, mask_access
+    );
+
+    const size_t group_count = (output_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    cgh.parallel_for<class MaxPoolForwardNHWC<Eigen::half, int64>>(
+      sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
+      maxPool
+    );
+  });
+
+  return device.ok();
+}
+
+template <typename dtype, typename mask_dtype>
+class MaxPoolBackward {
+  using atomic_accessor = sycl::accessor<uint32_t, 1, sycl::access::mode::atomic, sycl::access::target::global_buffer>;
+  using read_accessor = sycl::accessor<uint8_t, 1, sycl::access::mode::read, sycl::access::target::global_buffer>;
+public:
+  MaxPoolBackward(const int nthreads, read_accessor top_diff,
+                  read_accessor mask, const int top_offset,
+                  const int bottom_offset, atomic_accessor bottom_diff)
+      :nthreads_(nthreads)
+      ,top_diff_(top_diff)
+      ,mask_(mask)
+      ,top_offset_(top_offset)
+      ,bottom_offset_(bottom_offset)
+      ,bottom_diff_(bottom_diff) {
+  }
+
+  void operator()(sycl::nd_item<1> item) {
+    const dtype* top_diff = ConvertToActualTypeSycl(dtype, top_diff_);
+    const mask_dtype* mask = ConvertToActualTypeSycl(mask_dtype, mask_);
+    for (int index = item.get_global(0); index < nthreads_; index += item.get_num_groups(0) * item.get_local_range()[0]) {
+      int image_id = (index / top_offset_);
+      SyclAtomicOperation<std::plus<dtype>>(bottom_diff_[image_id * bottom_offset_ + mask[index]],
+                                            top_diff[index]);
+    }
+  }
+
+ private:
+  const int nthreads_;
+  read_accessor top_diff_;
+  read_accessor mask_;
+  const int top_offset_;
+  const int bottom_offset_;
+  atomic_accessor bottom_diff_;
+};
+
+bool MaxPoolBackwardWithArgmax(const int output_size, const int input_size,
+                               const float* top_diff, const int64* mask,
+                               const int top_offset, const int bottom_offset,
+                               float* bottom_diff, const Eigen::SyclDevice& d) {
+
+  const int kThreadsPerBlock = 1024;
+
+  auto& bottom_buffer_bytes = d.get_sycl_buffer(bottom_diff);
+  sycl::buffer<uint32_t, 1> bottom_buffer(
+    reinterpret_cast<sycl::buffer<uint32_t, 1, sycl::default_allocator<uint32_t>> &>(bottom_buffer_bytes),
+    sycl::id<1>(0),
+    sycl::range<1>(bottom_buffer_bytes.get_size() / sizeof(uint32_t))
+  );
+
+  d.sycl_queue().submit([&](sycl::handler& cgh) {
+    auto bottom_access = bottom_buffer.template get_access<sycl::access::mode::write>(cgh);
+    SetZero<float, decltype(bottom_access)> setZero(input_size, bottom_access);
+
+    const size_t group_count = (input_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    cgh.parallel_for<class SetZero<float, decltype(bottom_access)>>(
+      sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
+      setZero
+    );
+  });
+
+  auto mask_buffer = d.get_sycl_buffer(mask);
+  auto top_diff_buffer = d.get_sycl_buffer(top_diff);
+
+  d.sycl_queue().submit([&](sycl::handler& cgh) {
+    auto bottom_access = bottom_buffer.template get_access<sycl::access::mode::atomic>(cgh);
+    auto mask_access = mask_buffer.template get_access<sycl::access::mode::read>(cgh);
+    auto top_access = top_diff_buffer.template get_access<sycl::access::mode::read>(cgh);
+    MaxPoolBackward<float, int64> maxPoolBackward(output_size, top_access, mask_access, top_offset, bottom_offset, bottom_access);
+
+    const size_t group_count = (output_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    cgh.parallel_for<class MaxPoolBackward<float, int64>>(
+      sycl::nd_range<1>(sycl::range<1>(group_count * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock)),
+      maxPoolBackward
+    );
+  });
+
+  return d.ok();
+}
+
+template <typename T>
+struct LaunchMaxPoolingNoMask<Eigen::SyclDevice, T> {
+  static void launch(OpKernelContext* context, const PoolParameters& params,
+                     const Tensor& input, Tensor* output) {
+    bool status = MaxPoolForwardWithOptionalArgmax(
+        input.flat<T>().data(), params.tensor_in_batch, params.tensor_in_rows,
+        params.tensor_in_cols, params.depth, params.out_height,
+        params.out_width, params.window_rows, params.window_cols,
+        params.row_stride, params.col_stride, params.pad_rows, params.pad_cols,
+        output->flat<T>().data(), nullptr, context->eigen_sycl_device());
+    if (!status) {
+      context->SetStatus(
+          errors::Internal("Failed launching MaxPoolForwardNoMask"));
+    }
+  }
+};
+
+REGISTER_KERNEL_BUILDER(
+    Name("MaxPool").Device(DEVICE_SYCL).TypeConstraint<float>("T"),
+    MaxPoolingNoMaskOp<Eigen::SyclDevice, float>);
+
+template <typename T>
+struct LaunchMaxPoolingWithArgmax<Eigen::SyclDevice, T> {
+  static void launch(OpKernelContext* context, const PoolParameters& params,
+                     const Tensor& input, Tensor* output, Tensor* argmax) {
+    bool status = MaxPoolForwardWithOptionalArgmax(
+        input.flat<T>().data(), params.tensor_in_batch, params.tensor_in_rows,
+        params.tensor_in_cols, params.depth, params.out_height,
+        params.out_width, params.window_rows, params.window_cols,
+        params.row_stride, params.col_stride, params.pad_rows, params.pad_cols,
+        output->flat<T>().data(),
+        reinterpret_cast<int64*>(argmax->flat<int64>().data()),
+        context->eigen_sycl_device());
+    if (!status) {
+      context->SetStatus(
+          errors::Internal("Failed launching MaxPoolForwardWithArgmax"));
+    }
+  }
+};
+
+REGISTER_KERNEL_BUILDER(Name("MaxPoolWithArgmax")
+                            .Device(DEVICE_SYCL)
+                            .TypeConstraint<int64>("Targmax")
+                            .TypeConstraint<float>("T"),
+                        MaxPoolingWithArgmaxOp<Eigen::SyclDevice, float>);
+
+template <typename T>
+struct LaunchMaxPoolingGradWithArgmax<Eigen::SyclDevice, T> {
+  static void launch(OpKernelContext* context, const PoolParameters& params,
+                     const Tensor& grad_in, const Tensor& argmax,
+                     Tensor* grad_out) {
+    const int input_size = params.tensor_in_batch * params.tensor_in_rows *
+                           params.tensor_in_cols * params.depth;
+    const int output_size = params.tensor_in_batch * params.out_height *
+                            params.out_width * params.depth;
+    const int top_offset = params.out_height * params.out_width * params.depth;
+    const int bottom_offset =
+        params.tensor_in_rows * params.tensor_in_cols * params.depth;
+    bool status = MaxPoolBackwardWithArgmax(
+        output_size, input_size, grad_in.flat<T>().data(),
+        reinterpret_cast<const int64*>(argmax.flat<int64>().data()), top_offset,
+        bottom_offset, grad_out->flat<T>().data(), context->eigen_sycl_device());
+    if (!status) {
+      context->SetStatus(
+          errors::Internal("Failed launching MaxPoolForwardWithArgmax"));
+    }
+  }
+};
+
+REGISTER_KERNEL_BUILDER(
+    Name("MaxPoolGradWithArgmax")
+        .Device(DEVICE_SYCL)
+        .TypeConstraint<float>("T")
+        .TypeConstraint<int64>("Targmax"),
+    MaxPoolingGradWithArgmaxOp<Eigen::SyclDevice, float>);
+
+#endif  // TENSORFLOW_USE_SYCL
 
 }  // namespace tensorflow
