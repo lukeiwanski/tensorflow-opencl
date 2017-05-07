@@ -43,6 +43,10 @@ limitations under the License.
 #include "tensorflow/core/platform/stream_executor.h"
 #endif  // GOOGLE_CUDA
 
+#if TENSORFLOW_USE_SYCL
+#include "tensorflow/core/util/sycl_kernel_helper.h"
+#endif
+
 namespace tensorflow {
 
 typedef Eigen::ThreadPoolDevice CPUDevice;
@@ -448,42 +452,6 @@ REGISTER_KERNEL_BUILDER(
 
 using namespace cl;
 
-template <typename dtype, typename write_accessor>
-class SetZero {
-public:
-  SetZero(const int nthreads, write_accessor bottom_diff_access)
-      :nthreads_(nthreads)
-      ,bottom_diff_access_(bottom_diff_access) {
-  }
-
-  void operator()(sycl::nd_item<1> item) {
-    dtype* bottom_diff = ConvertToActualTypeSycl(dtype, bottom_diff_access_);
-    for (int index = item.get_global(0); index < nthreads_; index += item.get_global_range(0)) {
-      *(bottom_diff + index) = dtype(0);
-    }
-  }
-
-private:
-  const int nthreads_;
-  write_accessor bottom_diff_access_;
-};
-
-template <typename BinaryOperation>
-void SyclAtomicOperation(cl::sycl::atomic<uint32_t> element, float value) {
-  union {
-    uint32_t u32;
-    float f32;
-  } next, expected;
-
-  BinaryOperation operation;
-  expected.u32 = element.load();
-  do {
-    next.f32 = operation(expected.f32, value);
-  } while (element.compare_exchange_strong(expected.u32, next.u32,
-           std::memory_order_relaxed,
-           std::memory_order_relaxed));
-}
-
 template <typename dtype>
 class MaxPoolBackwardNoMaskNHWC {
   using atomic_accessor = sycl::accessor<uint32_t, 1, sycl::access::mode::atomic, sycl::access::target::global_buffer>;
@@ -544,7 +512,8 @@ class MaxPoolBackwardNoMaskNHWC {
       // Atomically accumulate the bottom diff. The index could still be
       // uninitialized, if all the bottom_data are NaN.
       if (maxidx != -1) {
-        SyclAtomicOperation<std::plus<dtype>>(bottom_diff_[n * height_ * width_ * channels_ + maxidx], top_diff[index]);
+        SyclAtomicOperation<std::plus<dtype>>(bottom_diff_[n * height_ * width_ * channels_ + maxidx],
+                                              top_diff[index]);
       }
     }
   }
@@ -566,7 +535,6 @@ private:
   read_accessor top_diff_;
   atomic_accessor bottom_diff_;
 };
-
 
 bool MaxPoolBackwardNoMask(const float* bottom_data, const int batch,
                            const int height, const int width,
@@ -1247,7 +1215,8 @@ public:
     const mask_dtype* mask = ConvertToActualTypeSycl(mask_dtype, mask_);
     for (int index = item.get_global(0); index < nthreads_; index += item.get_num_groups(0) * item.get_local_range()[0]) {
       int image_id = (index / top_offset_);
-      SyclAtomicOperation<std::plus<dtype>>(bottom_diff_[image_id * bottom_offset_ + mask[index]], top_diff[index]);
+      SyclAtomicOperation<std::plus<dtype>>(bottom_diff_[image_id * bottom_offset_ + mask[index]],
+                                            top_diff[index]);
     }
   }
 
@@ -1269,7 +1238,7 @@ bool MaxPoolBackwardWithArgmax(const int output_size, const int input_size,
 
   auto& bottom_buffer_bytes = d.get_sycl_buffer(bottom_diff);
   sycl::buffer<uint32_t, 1> bottom_buffer(
-    reinterpret_cast<sycl::buffer<uint32_t, 1, cl::sycl::default_allocator<uint32_t>> &>(bottom_buffer_bytes),
+    reinterpret_cast<sycl::buffer<uint32_t, 1, sycl::default_allocator<uint32_t>> &>(bottom_buffer_bytes),
     sycl::id<1>(0),
     sycl::range<1>(bottom_buffer_bytes.get_size() / sizeof(uint32_t))
   );
